@@ -1,6 +1,6 @@
 """Assignment 3's working solution, over Assignment 2's planned way: the same plan,
 boundary, checkpoint and second pass, with Assignment 3's tools and the PR step.
-It ships in Assignment 4's starter in place of your own Assignment 3 code.
+Assignment 4 adds what survives a crash and what survives a run.
 
 Assignment 3 changes four things here:
   - Tools are found by role (harness.roles), never by name: the names are the
@@ -16,6 +16,37 @@ Assignment 3 changes four things here:
     or the model wrote. The model fills only its title and body.
   - A write the registry cannot confirm (tools.Unverifiable, the third exit) ends
     the run escalated: a person on review duty decides.
+
+Assignment 4 adds five things, and changes no rule above:
+
+  - **Checkpoints** (Part A), saved through state/checkpointer.py in DURABILITY
+    mode, which is sync: this run has two irreversible steps, and slide 12's rule
+    is sync for any run with one. They go after each read worth not repeating (the
+    search and the file read, each of which costs a fill call) and immediately
+    before each write, after its arguments are filled and before the call, so that
+    the arguments the key is hashed from are on disk before the write runs. The
+    issue read gets none: repeating it costs one tool call and no model tokens.
+    Assignment 2's Executor.checkpoint is a different thing, the point where the
+    plan may be revised; this one is save_state.
+  - **Resume** (Part B). run() asks the checkpointer for this run_id's last
+    checkpoint. There is one only after a crash, and then the run replays from it:
+    a step that completed is skipped and its recorded result reused, and a write is
+    replayed with the arguments the checkpoint saved, never with new ones from the
+    model, because a new argument is a new key and a new key is a second write. The
+    step that was running at the crash is replayed through the registry, whose
+    check before every attempt is what settles whether it already happened.
+  - **The store** (Part D), state/store.py, read before the plan is written, so the
+    store_read line comes before the first search, and written at the end of a run
+    that decided. Records sourced issue:<n> are retrieved and logged and never
+    rendered into a prompt.
+  - **Part F's switches**, read from the environment: TELL_FACT (off, prominent,
+    buried or early) tells the run a maintainer's rule and decides where it sits,
+    COMPACT_AT compacts the fill history at a low threshold, and FACT_NOTE keeps
+    the fact in a structured note outside that history. All three are off unless
+    set, so every other run of this way is the run Assignment 3 left.
+  - **Part E's shadow copy**: with CP_SHADOW set, every checkpoint is written a
+    second time, with the conversation, to its own file. Never to the checkpoint
+    database.
 
 The boundary: the executor runs the plan's steps in order and nothing else. Where a
 step's arguments are "$fill", one model call fills them, offered that step's tool
@@ -50,15 +81,21 @@ from __future__ import annotations
 
 import copy
 import json
+import math
+import os
 import re
+from datetime import datetime, timezone
 
 from agent.critique import self_critique, verify
 from agent.diff import step_args
 from agent.plan import SCHEMA, make_plan, revise_plan
 from agent.validator import validate
-from harness.formats import FILL, format_triage_comment, parse_triage_comment, result_paths
+from harness import ROOT
+from harness.formats import FILL, format_triage_comment, parse_triage_comment, result_paths, squeeze
 from harness.roles import arg, tool_for
 from harness.schema import errors as schema_errors
+from state import store as memory
+from state.checkpointer import Checkpointer
 from tools import Unverifiable
 
 MAX_REPLANS = 2       # three planner calls in all; a fourth on the same request is the same coin, so a person looks
@@ -68,6 +105,79 @@ MAX_FILL_TRIES = 2    # a step the model will not fill on plan, twice, halts the
 CHECKPOINT = "after_first_search"
 SOURCE = re.compile(r"^src/(?!i18n/).+\.tsx?$")   # code, not documentation or translations
 CONTEXT_CHARS = 6000  # of each earlier result, in a fill call
+
+# -- Assignment 4 ---------------------------------------------------------------------------------
+
+DURABILITY = "sync"                     # one mode for the run (slide 12): it has irreversible steps
+SAVE_AFTER = ("search", "read_file")    # the reads worth not repeating: each costs a fill call
+SHADOW = ROOT / "state" / "checkpoints_with_conversation.jsonl"   # Part E only; never the checkpoint database
+
+# Part F. The fact a run can be told, as a maintainer stated it, and when. It changes
+# what the comment says and nothing else: a rule that also said where fixes go would
+# make the model refuse the pull request.
+MAINTAINER = "priya-s"
+FACT_WHEN = "2026-10-20T09:15:00Z"
+FACT = ("Ledgerline's maintainers label every report about the Export button as feature: "
+        "they plan its fixes on the feature board.")
+FACT_PLACES = ("off", "prominent", "buried", "early")
+
+# Part F, the attention case: Ledgerline's own files, with the fact a plain line halfway
+# through them and no heading to mark it. The answer file of either development issue is
+# left out, so the filler steers nothing but where the fact sits.
+FILLER_FILES = ("src/api/reports.ts", "src/ingest/queue.ts", "src/db/repos/reportRepo.ts",
+                "src/ingest/worker.ts", "src/api/uploads.ts", "src/api/auth.ts", "src/config.ts",
+                "src/db/repos/userRepo.ts", "src/db/repos/transactionRepo.ts")
+
+SUMMARY = "## Summary of the earlier steps"
+KEEP = 1              # turns kept as they were when the history is compacted
+
+
+def env(name: str, default: str = "") -> str:
+    return os.environ.get(name, "").strip() or default
+
+
+def flag(name: str) -> bool:
+    return env(name).lower() not in ("", "0", "off", "false", "no")
+
+
+def fact_place() -> str:
+    """TELL_FACT: off, or where the maintainer's note sits in a fill call."""
+    place = env("TELL_FACT", "off").lower()
+    if place not in FACT_PLACES:
+        raise SystemExit(f"TELL_FACT={place!r}: one of {FACT_PLACES}, or unset")
+    return place
+
+
+def compact_at() -> int:
+    """COMPACT_AT: the token threshold the fill history is compacted at, or 0 for never."""
+    try:
+        return max(0, int(env("COMPACT_AT", "0")))
+    except ValueError:
+        raise SystemExit("COMPACT_AT: a number of tokens, or unset")
+
+
+def tokens(text: str) -> int:
+    return math.ceil(len(text) / 4)
+
+
+def today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+_filler: str | None = None
+
+
+def filler() -> str:
+    """Ledgerline's own files, concatenated, with the fact halfway through: the same text
+    every time, so the two attention runs differ only in where the fact sits."""
+    global _filler
+    if _filler is None:
+        repo = ROOT / "fixtures" / "repo"
+        parts = [f"{name}\n{(repo / name).read_text()}" for name in FILLER_FILES]
+        text = "\n\n".join(parts)
+        cut = text.find("\n", len(text) // 2) + 1
+        _filler = text[:cut] + FACT + "\n" + text[cut:]
+    return _filler
 
 
 def role(name: str | None) -> str | None:
@@ -82,12 +192,100 @@ def allows_null(spec: dict) -> bool:
         isinstance(b, dict) and allows_null(b) for b in spec.get("anyOf") or spec.get("oneOf") or [])
 
 
+class Recording:
+    """Part E only. A client that keeps every message this way has sent the model, so
+    that a checkpoint can be weighed with and without the conversation. It is wrapped
+    around ctx.client only when CP_SHADOW is set; the run's totals are still the
+    runner's client's, which this one calls."""
+
+    def __init__(self, client):
+        self._client = client
+        self.turns: list[dict] = []
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+    def create(self, **kwargs):
+        response = self._client.create(**kwargs)
+        if kwargs.get("system"):
+            self.turns.append({"role": "system", "content": kwargs["system"]})
+        self.turns += [{"role": m.get("role"), "content": m.get("content")} for m in kwargs.get("messages") or []]
+        self.turns.append({"role": "assistant", "content": response.content})
+        return response
+
+
+def shadow_client(ctx):
+    """Replace ctx.client with a recording one, for Part E's measurement only."""
+    if not flag("CP_SHADOW"):
+        return None
+    ctx.client = Recording(ctx.client)
+    return ctx.client
+
+
+# -- the store, before the plan and after the run ---------------------------------------------------
+
+def retrieve(ctx, store) -> list[dict]:
+    """The active records for this repository and this issue, read before the plan is
+    written, so that the store_read line comes before the run's first search."""
+    records = store.active(memory.REPOSITORY, ctx.issue_number)
+    ctx.trace.event("store_read", issue=ctx.issue_number, records=[r["id"] for r in records])
+    return records
+
+
+def already_held(store, text: str) -> bool:
+    want = squeeze(text)
+    return any(squeeze(r["text"]) == want for r in store.records() if r["active"])
+
+
+def stated_rule() -> dict | None:
+    """Part F. A run told the maintainer's rule keeps it as it was stated, word for word,
+    with who stated it and when: the write policy's "stated rather than inferred"."""
+    if fact_place() == "off":
+        return None
+    return {"repository": memory.REPOSITORY, "issue": None, "kind": "procedural", "text": FACT,
+            "source": "user", "stated_by": MAINTAINER, "written_at": FACT_WHEN,
+            "origin": "ingested", "confirmed": True}
+
+
+def remember(ctx, executor, store) -> None:
+    """The write policy's "when": at the end of a run, once it has decided, and never
+    mid-run on a guess the next step might overturn."""
+    written = []
+    rule = stated_rule()
+    if rule is not None and not already_held(store, rule["text"]):
+        written.append(store.write(rule))
+    findings = getattr(executor, "findings", None) or {}
+    if executor is not None and executor.posted and findings.get("label"):
+        text = (f"On {today()} RepoMind triaged issue {ctx.issue_number} as label: {findings['label']}, "
+                f"file: {findings.get('file') or 'none'}, and posted the comment that says so.")
+        if not already_held(store, text):
+            written.append(store.write({
+                "repository": memory.REPOSITORY, "issue": ctx.issue_number, "kind": "episodic", "text": text,
+                "source": "memory", "origin": "derived", "confirmed": True}))
+    if written:
+        ctx.trace.event("store_write", issue=ctx.issue_number, records=written)
+
+
+# -- the run ------------------------------------------------------------------------------------------
+
 def run(ctx) -> None:
-    plan = plan_until_valid(ctx)
-    if plan is None:
-        return
-    ctx.trace.plan(1, plan)
-    Executor(ctx, plan).run()
+    shadow_client(ctx)
+    store = memory.for_run(ctx.run_id)
+    records = retrieve(ctx, store)
+    saver = Checkpointer()
+    saved = saver.last(ctx.run_id)
+    if saved is not None:                         # a resume: replay from the last checkpoint
+        executor = Executor(ctx, saved.get("plan") or {"meta": {}, "steps": []},
+                            store=store, memory=records, saver=saver)
+        executor.restore(saved)
+    else:
+        plan = plan_until_valid(ctx)
+        if plan is None:
+            return                                # escalated with nothing decided: the store stays as it was
+        ctx.trace.plan(1, plan)
+        executor = Executor(ctx, plan, store=store, memory=records, saver=saver)
+    executor.run()
+    remember(ctx, executor, store)
 
 
 def schema_check(ctx, plan: dict, version: int) -> list[dict]:
@@ -127,7 +325,7 @@ def plan_until_valid(ctx) -> dict | None:
 class Executor:
     critique = True   # the notes way turns the second pass off
 
-    def __init__(self, ctx, plan: dict):
+    def __init__(self, ctx, plan: dict, *, store=None, memory=None, saver=None):
         self.ctx = ctx
         self.plan = copy.deepcopy(plan)
         self.version = 1
@@ -137,6 +335,20 @@ class Executor:
         self.revisions = 0
         self.revised: set[str] = set()   # ids of steps a revision added or changed: the checkpoint follows them
         self.ran: set[str] = set()       # ids of steps that ran and are not to run again
+        # Assignment 4
+        self.store = store
+        self.memory = list(memory or [])
+        self.saver = saver or Checkpointer()
+        self.completed: list[dict] = []  # one entry per tool call that reached its tool, with its key
+        self.findings: dict = {"label": None, "file": None, "comment_args": None, "pr_args": None}
+        self.posted = False              # the comment is in the tracker, this run's or a replay's
+        self.resumed = False
+        self.fill_turns: list[str] = []       # the fill history, compacted past COMPACT_AT
+        self.compactions = 0
+        self.place = fact_place()
+        self.compact_at = compact_at()
+        if self.place == "early":        # the fact in an early turn, where a summary can drop it
+            self.fill_turns.append(f"## A note from {MAINTAINER} (maintainer), {FACT_WHEN[:10]}\n{FACT}")
 
     # -- the plan, in order ------------------------------------------------------------
     def next_step(self) -> dict | None:
@@ -164,6 +376,81 @@ class Executor:
                 return                            # halted, and ended escalated
             if role(step.get("tool")) == "search" and (first or str(step.get("id")) in self.revised):
                 self.checkpoint(CHECKPOINT, any(SOURCE.match(p) for p in result.get("paths") or []))
+            if role(step.get("tool")) in SAVE_AFTER:
+                self.save_state(step.get("id"), running=self.next_id())
+
+    def next_id(self):
+        step = self.next_step()
+        return None if step is None else step.get("id")
+
+    # -- Assignment 4: the checkpoint ----------------------------------------------------
+    def statuses(self, running=None) -> dict:
+        """Each plan step's status, keyed by its id; the one in hand is running."""
+        out = {str(s.get("id")): s.get("status") or "pending" for s in self.plan.get("steps") or []}
+        if running is not None and out.get(str(running), "pending") == "pending":
+            out[str(running)] = "running"
+        return out
+
+    def save_state(self, step, *, running=None, mode: str = DURABILITY) -> None:
+        """Slide 14's five fields, and nothing else. In sync mode the checkpoint is on
+        disk before this returns, and the trace line is written after it, so a reader of
+        the trace knows the save had already happened when the next line was written."""
+        plan = {**self.plan, "meta": {**(self.plan.get("meta") or {}), "version": self.version}}
+        checkpoint = {
+            "plan": plan,
+            "step_status": self.statuses(running),
+            "completed_calls": [dict(c) for c in self.completed],
+            "findings": {k: v for k, v in self.findings.items() if v is not None},
+            "current_step": None if running is None else str(running),
+        }
+        self.saver.save(self.ctx.run_id, checkpoint, step=step, mode=mode)
+        self.ctx.trace.event("checkpoint", step=step, mode=mode)
+        self.shadow(checkpoint, step, mode)
+
+    def shadow(self, checkpoint: dict, step, mode: str) -> None:
+        """Part E. The same checkpoint with the conversation, to its own file: every
+        message this way has sent the model so far. Never the checkpoint database, which
+        refuses one that holds a conversation."""
+        turns = getattr(self.ctx.client, "turns", None)
+        if turns is None:
+            return
+        payload = {**checkpoint, "conversation": [dict(t) for t in turns]}
+        line = {"run_id": self.ctx.run_id, "step": None if step is None else str(step), "mode": mode,
+                "structured_bytes": len(json.dumps(checkpoint, ensure_ascii=False).encode()),
+                "bytes": len(json.dumps(payload, ensure_ascii=False, default=str).encode()),
+                "checkpoint": payload}
+        SHADOW.parent.mkdir(parents=True, exist_ok=True)
+        with SHADOW.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(line, ensure_ascii=False, default=str) + "\n")
+
+    def restore(self, saved: dict) -> None:
+        """Replay from the last checkpoint: every step it says finished is skipped and its
+        recorded result reused, and the draft comes back as it was, so no model call
+        rewrites a write's arguments into a new key."""
+        self.resumed = True
+        self.version = int(((saved.get("plan") or {}).get("meta") or {}).get("version") or 1)
+        status = saved.get("step_status") or {}
+        self.completed = [dict(c) for c in saved.get("completed_calls") or []]
+        self.findings = {**self.findings, **(saved.get("findings") or {})}
+        for call in self.completed:
+            sid = str(call.get("step"))
+            self.outputs[sid] = str(call.get("result") or "")
+            self.results.append({"id": call.get("step"), "tool": call.get("tool"),
+                                 "status": status.get(sid, "done"), "count": None, "paths": [],
+                                 "error_code": None, "args": call.get("args") or {}})
+            self.fill_turns.append(f"## Step {call.get('step')}, {call.get('tool')}, {status.get(sid, 'done')}\n"
+                              f"{self.outputs[sid][:CONTEXT_CHARS]}")
+        for step in self.plan.get("steps") or []:
+            sid = str(step.get("id"))
+            if status.get(sid) in ("done", "failed", "skipped"):
+                step["status"] = status[sid]
+                self.ran.add(sid)                 # a step that ran is not run again; only the one in hand is
+        if self.findings.get("comment_args"):
+            self.draft = dict(self.findings["comment_args"])
+            self.drafted_file = self.findings.get("file") or "none"
+        self.ctx.trace.event("replay", from_step=saved.get("current_step"),
+                             skipped=sorted(self.ran), calls=len(self.completed),
+                             findings=sorted(k for k, v in self.findings.items() if v is not None))
 
     # -- one step ------------------------------------------------------------------------
     def run_step(self, step: dict) -> dict | None:
@@ -232,10 +519,53 @@ class Executor:
     def refuse(self, step: dict, call) -> None:
         self.ctx.trace.event("off_plan", step=step.get("id"), tool=call.name, input=call.input, version=self.version)
 
+    # -- what a fill call sees ---------------------------------------------------------------
+    def compact(self) -> None:
+        """Part F. Past COMPACT_AT tokens, every turn but the last KEEP becomes one
+        model-written summary of the tools called and the paths they returned. A rule
+        stated in an earlier turn does not survive that summary, which is the point of
+        the case: the fix is a note outside the history, not a bigger window."""
+        if not self.compact_at:
+            return
+        size = tokens("\n\n".join(self.fill_turns))
+        older, recent = self.fill_turns[:-KEEP], self.fill_turns[-KEEP:]
+        if not older or (len(older) == 1 and older[0].startswith(SUMMARY)) or size <= self.compact_at:
+            return
+        self.calls += 1
+        response = self.ctx.client.create(system=self.ctx.prompt("compact_steps.md"),
+                                          messages=[{"role": "user", "content": "\n\n".join(older)}])
+        self.ctx.trace.model_call(self.calls, response)
+        self.fill_turns = [f"{SUMMARY}\n{response.text}"] + recent
+        self.compactions += 1
+        self.ctx.trace.event("compaction", threshold=self.compact_at, tokens=size,
+                             summarized=len(older), kept=len(recent))
+
     def context(self) -> list[str]:
         """What the run has gathered so far, one block per step, for a fill or a critique."""
-        return [f"## Step {r['id']}, {r['tool']}, {r['status']}\n{self.outputs.get(str(r['id']), '')[:CONTEXT_CHARS]}"
-                for r in self.results]
+        if self.compact_at:
+            self.compact()
+            history = list(self.fill_turns)
+        else:
+            history = [f"## Step {r['id']}, {r['tool']}, {r['status']}\n{self.outputs.get(str(r['id']), '')[:CONTEXT_CHARS]}"
+                       for r in self.results]
+        if self.place == "buried":
+            history = [f"Background, from Ledgerline's own files:\n\n{filler()}"] + history
+        return history
+
+    def standing(self) -> list[str]:
+        """What is kept outside the history and shown on every call: the memory store's
+        active records, and Part F's structured note."""
+        blocks = []
+        rendered = memory.render(self.memory)
+        if rendered:
+            blocks.append(self.ctx.prompt("memory.md").strip() + "\n\n" + rendered)
+        if self.place != "off" and flag("FACT_NOTE"):
+            blocks.append("A standing note, kept outside this conversation and shown on every call.\n"
+                          f"{MAINTAINER} (maintainer), {FACT_WHEN[:10]}: {FACT}")
+        if self.place == "prominent":
+            blocks.append(f"A note from Ledgerline's maintainers, not from the issue. {MAINTAINER} "
+                          f"(maintainer), {FACT_WHEN[:10]}: {FACT}")
+        return blocks
 
     def fill_request(self, step: dict, fixed: dict, keys: list[str], note: str = "") -> str:
         parts = [f"Triage issue #{self.ctx.issue_number}. You are running step {step.get('id')} of a fixed "
@@ -253,7 +583,7 @@ class Executor:
             parts.append("The plan's notes on them: " + "; ".join(f"{k}: {v}" for k, v in notes.items()))
         if note:
             parts.append(note)
-        return "\n\n".join(parts + self.context())
+        return "\n\n".join(parts + self.context() + self.standing())
 
     def record(self, step: dict, args: dict, result, error: str | None = None) -> dict:
         tool = step.get("tool")
@@ -272,14 +602,31 @@ class Executor:
         self.results.append(entry)
         self.ran.add(str(step.get("id")))
         self.outputs[str(step.get("id"))] = text
+        self.fill_turns.append(f"## Step {entry['id']}, {tool}, {status}\n{text[:CONTEXT_CHARS]}")
+        self.remember_call(step, tool, args, result)
         for s in self.plan.get("steps") or []:
             if str(s.get("id")) == str(step.get("id")):
                 s["status"] = entry["status"]
         return entry
 
+    def remember_call(self, step: dict, tool, args: dict, result) -> None:
+        """completed_calls: one entry per tool call that reached its tool, with the
+        idempotency key it carried (null for a read) and what it returned, so that a
+        resumed run takes a later step's context from here and never calls again. A write
+        the boundary rejected never reached the registry and carried no key, so it is not
+        one of these; its status says it failed."""
+        if result is None:
+            return
+        key = getattr(result, "key", None)
+        if role(tool) in ("comment", "open_pr") and not key:
+            return
+        self.completed.append({"step": step.get("id"), "tool": tool, "args": args, "key": key,
+                               "result": (result.content or "")[:CONTEXT_CHARS]})
+
     # -- revision, at the checkpoint whose check failed --------------------------------------
     def checkpoint(self, name: str, ok: bool) -> bool:
-        """True when a new version is now active."""
+        """Assignment 2's checkpoint, where the plan may be revised: nothing is saved here.
+        True when a new version is now active."""
         if ok or self.revisions >= MAX_REVISIONS:
             return False
         self.revisions += 1
@@ -321,32 +668,43 @@ class Executor:
             self.ctx.trace.end("escalated", detail=f"the draft still failed the second pass after {MAX_ROUNDS} rounds")
             return False
         self.draft = final
-        self.drafted_file = parse_triage_comment(str(final.get(arg("comment", "body"))))[1] or "none"
+        label, file = parse_triage_comment(str(final.get(arg("comment", "body"))))
+        self.drafted_file = file or "none"
+        self.findings.update({"label": label or "bug", "file": self.drafted_file,
+                              "comment_args": dict(final)})
         return True
 
     def post(self, step: dict) -> bool:
         """Post the checked draft, the run's last write. False when the run has ended."""
+        self.save_state(step.get("id"), running=step.get("id"))   # the arguments on disk before the write
         result = self.call(step, step["tool"], self.draft)
         if result is None:
             return False
         self.record(step, self.draft, result)
+        self.posted = not result.is_error
         return True
 
     # -- the pull request, before the comment ---------------------------------------------------
     def pull_request(self, step: dict) -> bool:
         """Open the draft PR when the comment's draft names a file; skip the step when it
-        says none. The issue and the branch are fixed here, by code. False when the run
-        has ended."""
+        says none. The issue and the branch are fixed here, by code. A resume opens it with
+        the arguments the checkpoint saved, never with new ones: a new argument is a new
+        key. False when the run has ended."""
         if self.drafted_file in (None, "none"):
             self.record(step, step_args(step), None, "skipped")
             return True
         number = self.ctx.issue_number
-        args = step_args(step)
-        args[arg("open_pr", "number")] = f"issue-{number}"
-        args[arg("open_pr", "branch")] = f"repomind/issue-{number}"
-        filled = self.filled(step, args)
-        if filled is None:
-            return False
+        if self.findings.get("pr_args"):
+            filled = dict(self.findings["pr_args"])
+        else:
+            args = step_args(step)
+            args[arg("open_pr", "number")] = f"issue-{number}"
+            args[arg("open_pr", "branch")] = f"repomind/issue-{number}"
+            filled = self.filled(step, args)
+            if filled is None:
+                return False
+            self.findings["pr_args"] = dict(filled)
+        self.save_state(step.get("id"), running=step.get("id"))   # the arguments on disk before the write
         result = self.call(step, step["tool"], filled)
         if result is None:
             return False
