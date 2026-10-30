@@ -22,6 +22,11 @@ Submit the plan with submit_plan, once. Each step:
   example "{\"issue\": \"issue-4191\"}". Write "$fill" for any value that depends on
   what an earlier step finds: search terms, a file path, the comment's text, the
   pull request's title and body. The issue is the one value you know now.
+  Every such value is the three characters "$fill" on their own, never a template,
+  an example or a partly written one: the comment's body is "$fill", not the two
+  lines above with "$fill" in them, and the pull request's body is "$fill" too.
+  The step that runs writes them; a template you write here is posted as you wrote
+  it.
 - depends_on: the ids of earlier steps whose results this step uses. Never a later
   step.
 - expected_result: what the step returns when it worked, something a program could

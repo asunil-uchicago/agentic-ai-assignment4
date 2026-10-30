@@ -27,51 +27,242 @@
     }
   ],
   "durability": "sync",
-  "uncrashed_run_id": null,
-  "matrix_derived": [],
-  "matrix_uuid": [],
-  "duplicate_comment_ids": {},
+  "uncrashed_run_id": "planned-4201-s01-2f6dd7",
+  "matrix_derived": [
+    {
+      "run_id": "planned-4201-s01-da8380",
+      "step": 1,
+      "when": "after",
+      "comments": 1,
+      "open_prs": 1,
+      "matches": true
+    },
+    {
+      "run_id": "planned-4201-s01-37d8dc",
+      "step": 2,
+      "when": "after",
+      "comments": 1,
+      "open_prs": 1,
+      "matches": true
+    },
+    {
+      "run_id": "planned-4201-s01-c0454b",
+      "step": 3,
+      "when": "after",
+      "comments": 1,
+      "open_prs": 1,
+      "matches": true
+    },
+    {
+      "run_id": "planned-4201-s01-005600",
+      "step": 4,
+      "when": "after",
+      "comments": 1,
+      "open_prs": 1,
+      "matches": true
+    },
+    {
+      "run_id": "planned-4201-s01-3afd3b",
+      "step": 5,
+      "when": "after",
+      "comments": 1,
+      "open_prs": 1,
+      "matches": true
+    },
+    {
+      "run_id": "planned-4201-s01-66db68",
+      "step": 1,
+      "when": "during",
+      "comments": 1,
+      "open_prs": 1,
+      "matches": true
+    },
+    {
+      "run_id": "planned-4201-s01-08af68",
+      "step": 2,
+      "when": "during",
+      "comments": 1,
+      "open_prs": 1,
+      "matches": true
+    },
+    {
+      "run_id": "planned-4201-s01-b764d0",
+      "step": 3,
+      "when": "during",
+      "comments": 1,
+      "open_prs": 1,
+      "matches": true
+    },
+    {
+      "run_id": "planned-4201-s01-98bf47",
+      "step": 4,
+      "when": "during",
+      "comments": 1,
+      "open_prs": 1,
+      "matches": true
+    },
+    {
+      "run_id": "planned-4201-s01-bdb81c",
+      "step": 5,
+      "when": "during",
+      "comments": 1,
+      "open_prs": 1,
+      "matches": true
+    }
+  ],
+  "matrix_uuid": [
+    {
+      "run_id": "planned-4201-s01-33b69b",
+      "step": 1,
+      "when": "after",
+      "comments": 1,
+      "open_prs": 1,
+      "matches": true
+    },
+    {
+      "run_id": "planned-4201-s01-5433fe",
+      "step": 2,
+      "when": "after",
+      "comments": 1,
+      "open_prs": 1,
+      "matches": true
+    },
+    {
+      "run_id": "planned-4201-s01-2f388a",
+      "step": 3,
+      "when": "after",
+      "comments": 1,
+      "open_prs": 1,
+      "matches": true
+    },
+    {
+      "run_id": "planned-4201-s01-52d002",
+      "step": 4,
+      "when": "after",
+      "comments": 1,
+      "open_prs": 1,
+      "matches": true
+    },
+    {
+      "run_id": "planned-4201-s01-628451",
+      "step": 5,
+      "when": "after",
+      "comments": 2,
+      "open_prs": 1,
+      "matches": false
+    },
+    {
+      "run_id": "planned-4201-s01-a214e8",
+      "step": 1,
+      "when": "during",
+      "comments": 1,
+      "open_prs": 1,
+      "matches": true
+    },
+    {
+      "run_id": "planned-4201-s01-7c5bcd",
+      "step": 2,
+      "when": "during",
+      "comments": 1,
+      "open_prs": 1,
+      "matches": true
+    },
+    {
+      "run_id": "planned-4201-s01-5ee1a0",
+      "step": 3,
+      "when": "during",
+      "comments": 1,
+      "open_prs": 1,
+      "matches": true
+    },
+    {
+      "run_id": "planned-4201-s01-e7c65a",
+      "step": 4,
+      "when": "during",
+      "comments": 1,
+      "open_prs": 1,
+      "matches": true
+    },
+    {
+      "run_id": "planned-4201-s01-918e49",
+      "step": 5,
+      "when": "during",
+      "comments": 2,
+      "open_prs": 1,
+      "matches": false
+    }
+  ],
+  "duplicate_comment_ids": {
+    "planned-4201-s01-628451": [
+      5,
+      6
+    ],
+    "planned-4201-s01-918e49": [
+      11,
+      12
+    ]
+  },
   "reopened": {
     "with_store": {
-      "runs": 0,
-      "passes": 0,
-      "mean_tool_calls": null,
-      "mean_tokens": null,
-      "run_ids": []
+      "runs": 5,
+      "passes": 5,
+      "mean_tool_calls": 6.2,
+      "mean_tokens": 17782,
+      "run_ids": [
+        "planned-4207-s01-219110",
+        "planned-4207-s02-438841",
+        "planned-4207-s03-e230b1",
+        "planned-4207-s04-5106a9",
+        "planned-4207-s05-384dbb"
+      ]
     },
     "empty_store": {
-      "runs": 0,
-      "passes": 0,
-      "mean_tool_calls": null,
-      "mean_tokens": null,
-      "run_ids": []
+      "runs": 5,
+      "passes": 5,
+      "mean_tool_calls": 6.0,
+      "mean_tokens": 14158,
+      "run_ids": [
+        "planned-4207-s01-58a72f",
+        "planned-4207-s02-2cbc3d",
+        "planned-4207-s03-489830",
+        "planned-4207-s04-d0c780",
+        "planned-4207-s05-109aaf"
+      ]
     }
   },
   "checkpoint_bytes": {
-    "structured": null,
-    "with_conversation": null,
-    "runs": 0
+    "structured": 18952,
+    "with_conversation": 102168,
+    "runs": 5
   },
-  "contradiction_test": [],
+  "contradiction_test": [
+    "mem-0005"
+  ],
   "forgetting": {
     "attention": {
-      "fact": null,
-      "effect": {},
-      "lost": null,
-      "fixed": null
+      "fact": "Ledgerline's maintainers label every report about the Export button as feature: they plan its fixes on the feature board.",
+      "effect": {
+        "label": "feature"
+      },
+      "lost": "planned-4192-s01-e42c21",
+      "fixed": "planned-4192-s01-df25b1"
     },
     "compaction": {
-      "fact": null,
-      "effect": {},
-      "lost": null,
-      "fixed": null
+      "fact": "Ledgerline's maintainers label every report about the Export button as feature: they plan its fixes on the feature board.",
+      "effect": {
+        "label": "feature"
+      },
+      "lost": "planned-4192-s01-c4fbd9",
+      "fixed": "planned-4192-s01-c98c0d"
     },
     "session": {
-      "fact": null,
-      "effect": {},
-      "stated": null,
-      "lost": null,
-      "fixed": null
+      "fact": "Ledgerline's maintainers label every report about the Export button as feature: they plan its fixes on the feature board.",
+      "effect": {
+        "label": "feature"
+      },
+      "stated": "planned-4192-s01-b94e2b",
+      "lost": "planned-4192-s01-847db8",
+      "fixed": "planned-4192-s01-8fd1c2"
     }
   }
 }

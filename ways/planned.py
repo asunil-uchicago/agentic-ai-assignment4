@@ -180,6 +180,13 @@ def filler() -> str:
     return _filler
 
 
+# The arguments the plan never knows and the step that runs must write (prompts/planner.md).
+# The reviser is shown neither the issue nor the arguments a step ran with, so a value it
+# writes into one of these is invented; "$fill" is restored and the executor writes it.
+EXECUTOR_ARGS = {"search": ("query",), "read_file": ("path",),
+                 "comment": ("body",), "open_pr": ("title", "body")}
+
+
 def role(name: str | None) -> str | None:
     """The role a step's tool plays, or None."""
     return next((r for r in ("read_issue", "search", "read_file", "comment", "open_pr") if tool_for(r) == name), None)
@@ -303,11 +310,32 @@ def schema_check(ctx, plan: dict, version: int) -> list[dict]:
     return [{"step": None, "check": "schema", "error": e} for e in problems[:5]]
 
 
+def wants_fill(value) -> bool:
+    """True when the plan left this argument for a later call to write. The planner is
+    told to write "$fill" and nothing else, but a model that wraps it in a template of
+    its own, such as "File: $fill", has left the same hole: the marker counts wherever
+    it sits. Taking only a leading marker is how a plan's template reaches the tracker
+    unfilled, which no later step can undo."""
+    return FILL in str(value)
+
+
+def named_tools(plan: dict) -> dict:
+    """Strip a namespace from each step's tool name. Some OpenAI-compatible models write
+    a tool as "functions.issues_read", the form their own API uses, and every check here
+    reads the bare name, so the plan is rejected five times over for a prefix. The name
+    is only accepted when its last segment is one of this repository's tools."""
+    for step in plan.get("steps") or []:
+        name = step.get("tool")
+        if isinstance(name, str) and "." in name and role(name) is None and role(name.rsplit(".", 1)[-1]):
+            step["tool"] = name.rsplit(".", 1)[-1]
+    return plan
+
+
 def plan_until_valid(ctx) -> dict | None:
     """The reject exit: re-plan up to MAX_REPLANS times, then escalate. Never execute a rejected plan."""
     failures = None
     for attempt in range(1, MAX_REPLANS + 2):
-        plan = make_plan(ctx.client, ctx.issue_number, ctx.tools.schemas, trace=ctx.trace, failures=failures)
+        plan = named_tools(make_plan(ctx.client, ctx.issue_number, ctx.tools.schemas, trace=ctx.trace, failures=failures))
         broken = schema_check(ctx, plan, 1)
         if broken:                                # rejected before the four checks: it never runs
             failures = broken
@@ -474,7 +502,7 @@ class Executor:
             return None
 
     def filled(self, step: dict, args: dict) -> dict | None:
-        to_fill = [k for k, v in args.items() if str(v).startswith(FILL)]   # "$fill", or "$fill: a note"
+        to_fill = [k for k, v in args.items() if wants_fill(v)]   # "$fill", "$fill: a note", or a template round it
         if not to_fill:
             return args
         filled = self.fill(step, args, to_fill)
@@ -492,7 +520,7 @@ class Executor:
         schema = next((t for t in self.ctx.tools.schemas if t["name"] == step["tool"]), None)
         if schema is None:
             return None
-        fixed = {k: v for k, v in args.items() if not str(v).startswith(FILL)}
+        fixed = {k: v for k, v in args.items() if not wants_fill(v)}
         props = (schema.get("input_schema") or {}).get("properties") or {}
         nullable = {k for k, s in props.items() if isinstance(s, dict) and allows_null(s)}
         for _ in range(MAX_FILL_TRIES):
@@ -505,7 +533,7 @@ class Executor:
                     self.refuse(step, call)       # the boundary: never run, always traced
                     continue
                 filled = {**{k: v for k, v in call.input.items() if k in props}, **fixed}   # the plan's values win
-                if any(k not in filled or filled[k] == "" or str(filled[k]).startswith(FILL)
+                if any(k not in filled or filled[k] == "" or wants_fill(filled[k])
                        or (filled[k] is None and k not in nullable)
                        for k in keys):
                     continue
@@ -630,7 +658,7 @@ class Executor:
         if ok or self.revisions >= MAX_REVISIONS:
             return False
         self.revisions += 1
-        proposed = revise_plan(self.ctx.client, self.plan, self.results, trace=self.ctx.trace)
+        proposed = named_tools(revise_plan(self.ctx.client, self.plan, self.results, trace=self.ctx.trace))
         broken = schema_check(self.ctx, proposed, self.version + 1)
         verdict = {"valid": False, "failures": broken} if broken else validate(proposed)
         self.ctx.trace.event("revision", checkpoint=name, version=self.version + 1, valid=verdict["valid"],
@@ -641,6 +669,9 @@ class Executor:
         changed = {str(s.get("id")) for s in proposed.get("steps") or []
                    if before.get(str(s.get("id"))) != {k: v for k, v in s.items() if k != "status"}}
         self.revised |= changed
+        for step in proposed.get("steps") or []:
+            if str(step.get("id")) in changed:
+                self.restore_fills(step)
         failed = {str(r["id"]) for r in self.results if r["status"] == "failed"}
         done = {str(r["id"]) for r in self.results if r["status"] == "done"}
         self.ran -= (changed & failed) - done      # a failed step the revision changed runs again
@@ -648,6 +679,22 @@ class Executor:
         self.plan = proposed
         self.ctx.trace.plan(self.version, proposed)
         return True
+
+    @staticmethod
+    def restore_fills(step: dict) -> None:
+        """Put "$fill" back on a revised step's executor-owned arguments. A reviser that
+        never saw the issue cannot write a search query, and a query it invents is sent to
+        the tool as it stands, which is how a revision spends its retry on nothing. The
+        reviser's repair is the step's action; the executor still writes the value."""
+        names = [arg(role(step.get("tool")), a) for a in EXECUTOR_ARGS.get(role(step.get("tool")), ())]
+        args = step_args(step)
+        if not names or not any(args.get(n) is not None and not wants_fill(args[n]) for n in names):
+            return
+        for name in names:
+            if name in args:
+                args[name] = FILL
+        step.pop("args", None)
+        step["args_json"] = json.dumps(args)
 
     # -- the comment's draft and the second pass, before the first write ---------------------------
     draft: dict | None = None        # the comment's arguments, checked, waiting to be posted last
